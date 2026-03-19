@@ -13,3 +13,5 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Ignore the real Constants file containing API keys
+src/main/java/com/example/floorplan/Constants.java

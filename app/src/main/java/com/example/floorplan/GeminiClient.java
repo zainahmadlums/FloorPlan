@@ -14,7 +14,7 @@ import java.util.Scanner;
 
 public class GeminiClient {
 
-    private static final String API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + Constants.GEMINI_API_KEY;
+    private static final String API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + Constants.GEMINI_API_KEY;
 
     public interface GeminiCallback {
         void onSuccess(Bitmap floorPlan);
