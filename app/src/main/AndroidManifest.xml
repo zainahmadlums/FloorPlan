@@ -31,6 +31,7 @@
         <activity android:name=".ProcessingActivity" android:screenOrientation="portrait"/>
         <activity android:name=".ReviewActivity" android:screenOrientation="portrait"/>
         <activity android:name=".FullScreenActivity" android:screenOrientation="portrait"/>
+        <activity android:name=".EditActivity" android:screenOrientation="portrait"/>
 
         <provider
             android:name="androidx.core.content.FileProvider"

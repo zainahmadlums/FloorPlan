@@ -2,132 +2,132 @@ package com.example.floorplan;
 
 import android.graphics.Bitmap;
 import android.graphics.Color;
-import android.util.Base64;
-import org.json.JSONArray;
-import org.json.JSONObject;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.util.Scanner;
+import android.os.Handler;
+import android.os.Looper;
+
+import com.google.ai.client.generativeai.GenerativeModel;
+import com.google.ai.client.generativeai.java.GenerativeModelFutures;
+import com.google.ai.client.generativeai.type.Content;
+import com.google.ai.client.generativeai.type.GenerateContentResponse;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+
+import java.util.List;
+import java.util.concurrent.Executors;
 
 public class GeminiClient {
 
-    private static final String API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + Constants.GEMINI_API_KEY;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    public static final int GRID_SIZE = 30;
+    public static final int TOTAL_PIXELS = GRID_SIZE * GRID_SIZE;
+    String promptText = "I need a floor plan for representing the walkable areas by the instructor in the classroom to guide location tracking." +
+            "Act as an expert spatial analyst. Mentally synthesize these first-person images into a single coherent 3D room, then project it into a strict 2D top-down orthographic floor plan. " +
+            "If there are multiple images, they represent the same room from different positions." +
+            "Map this floor plan to a precise " + GRID_SIZE + "x" + GRID_SIZE + " grid.\n" +
+            "Values:\n" +
+            "'0' = Impassable (walls, furniture, empty void).\n" +
+            "'1' = Passable (clear, walkable floor space, pathway. The tiny space between rows of seats does not count, unless its substantial.).\n" +
+            "Rules:\n" +
+            "1. Traversal: Read left-to-right, top-to-bottom. The first character is the top-left corner, the last is the bottom-right corner.\n" +
+            "2. Padding: If the room is rectangular or irregular, you MUST pad the out-of-bounds edges with '0's to force a perfect square grid.\n" +
+            "3. Length: The output MUST be a single, unbroken string of EXACTLY " + TOTAL_PIXELS + " characters.\n" +
+            "CRITICAL CONSTRAINT: Output raw text only. No code blocks, no markdown formatting, no spaces, no newlines, and absolutely zero conversational text. Just the " + TOTAL_PIXELS + " binary digits.";
 
     public interface GeminiCallback {
-        void onSuccess(Bitmap floorPlan);
+        void onSuccess(Bitmap floorPlan, String rawGrid);
         void onError(String errorMessage);
     }
 
-    public void generateFloorPlan(Bitmap sourceImage, GeminiCallback callback) {
-        new Thread(() -> {
-            HttpURLConnection connection = null;
-            try {
-                String base64Image = encodeImageToBase64(sourceImage);
-                String jsonPayload = buildJsonPayload(base64Image);
+    public void generateFloorPlan(List<Bitmap> sourceImages, GeminiCallback callback) {
+        try {
+            GenerativeModel gm = new GenerativeModel("gemini-3-flash-preview", Constants.GEMINI_API_KEY);
+            GenerativeModelFutures model = GenerativeModelFutures.from(gm);
 
-                URL url = new URL(API_URL);
-                connection = (HttpURLConnection) url.openConnection();
-                connection.setRequestMethod("POST");
-                connection.setRequestProperty("Content-Type", "application/json");
-                connection.setDoOutput(true);
+            Content.Builder contentBuilder = new Content.Builder()
+                    .addText(promptText);
 
-                try (OutputStream os = connection.getOutputStream()) {
-                    byte[] input = jsonPayload.getBytes("utf-8");
-                    os.write(input, 0, input.length);
-                }
+            // Loop through all provided images and attach them to the request
+            for (Bitmap originalBitmap : sourceImages) {
+                Bitmap scaledImage = scaleBitmapDefensively(originalBitmap, 1024);
+                contentBuilder.addImage(scaledImage);
+            }
 
-                int responseCode = connection.getResponseCode();
-                if (responseCode == 429) {
-                    callback.onError("Limit reached. Please try again later.");
-                    return;
-                }
+            Content content = contentBuilder.build();
 
-                if (responseCode >= 200 && responseCode < 300) {
-                    Scanner scanner = new Scanner(new InputStreamReader(connection.getInputStream()));
-                    StringBuilder responseString = new StringBuilder();
-                    while (scanner.hasNextLine()) {
-                        responseString.append(scanner.nextLine());
-                    }
-                    scanner.close();
+            ListenableFuture<GenerateContentResponse> response = model.generateContent(content);
 
-                    String gridString = parseResponse(responseString.toString());
-                    Bitmap resultBitmap = convertGridToBitmap(gridString);
-                    if (resultBitmap != null) {
-                        callback.onSuccess(resultBitmap);
+            Futures.addCallback(response, new FutureCallback<GenerateContentResponse>() {
+                @Override
+                public void onSuccess(GenerateContentResponse result) {
+                    String gridString = result.getText();
+                    if (gridString != null) {
+                        String cleanString = gridString.replaceAll("[^01]", "");
+
+                        StringBuilder sb = new StringBuilder(cleanString);
+                        while (sb.length() < TOTAL_PIXELS) {
+                            sb.append("0");
+                        }
+                        if (sb.length() > TOTAL_PIXELS) {
+                            sb.setLength(TOTAL_PIXELS);
+                        }
+
+                        String paddedGrid = sb.toString();
+                        Bitmap resultBitmap = convertGridToBitmap(paddedGrid);
+
+                        if (resultBitmap != null) {
+                            postSuccess(callback, resultBitmap, paddedGrid);
+                        } else {
+                            postError(callback, "Failed to parse the grid properly.");
+                        }
                     } else {
-                        callback.onError("Failed to parse the grid properly.");
+                        postError(callback, "API returned an empty response.");
                     }
-                } else {
-                    callback.onError("API Error: " + responseCode);
                 }
-            } catch (Exception e) {
-                callback.onError(e.getMessage());
-            } finally {
-                if (connection != null) {
-                    connection.disconnect();
+
+                @Override
+                public void onFailure(Throwable t) {
+                    postError(callback, t.getMessage());
                 }
-            }
-        }).start();
-    }
+            }, Executors.newSingleThreadExecutor());
 
-    private String encodeImageToBase64(Bitmap bitmap) {
-        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 70, outputStream);
-        return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP);
-    }
-
-    private String buildJsonPayload(String base64Image) throws Exception {
-        JSONObject root = new JSONObject();
-        JSONArray contents = new JSONArray();
-        JSONObject contentObject = new JSONObject();
-        JSONArray parts = new JSONArray();
-
-        JSONObject textPart = new JSONObject();
-        textPart.put("text", "Analyze this room image and generate a 100x100 floor plan grid. Return ONLY a single contiguous string of 10000 characters consisting of '0's (impassable obstacles like seats/walls) and '1's (passable floor). Account for non-square rooms by padding with '0's. NO MARKDOWN, NO SPACES, NO NEWLINES, NO OTHER TEXT.");
-
-        JSONObject inlineDataPart = new JSONObject();
-        JSONObject inlineData = new JSONObject();
-        inlineData.put("mime_type", "image/jpeg");
-        inlineData.put("data", base64Image);
-        inlineDataPart.put("inline_data", inlineData);
-
-        parts.put(textPart);
-        parts.put(inlineDataPart);
-        contentObject.put("parts", parts);
-        contents.put(contentObject);
-        root.put("contents", contents);
-
-        return root.toString();
-    }
-
-    private String parseResponse(String jsonResponse) throws Exception {
-        JSONObject json = new JSONObject(jsonResponse);
-        String text = json.getJSONArray("candidates")
-                .getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts")
-                .getJSONObject(0)
-                .getString("text");
-
-        return text.replaceAll("[^01]", "");
-    }
-
-    private Bitmap convertGridToBitmap(String gridString) {
-        if (gridString.length() < 10000) {
-            return null;
+        } catch (Exception e) {
+            postError(callback, e.getMessage());
         }
+    }
 
-        Bitmap bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888);
+    private Bitmap scaleBitmapDefensively(Bitmap original, int maxDimension) {
+        int width = original.getWidth();
+        int height = original.getHeight();
+        if (width <= maxDimension && height <= maxDimension) {
+            return original;
+        }
+        float ratio = Math.min((float) maxDimension / width, (float) maxDimension / height);
+        int newWidth = Math.round(ratio * width);
+        int newHeight = Math.round(ratio * height);
+        return Bitmap.createScaledBitmap(original, newWidth, newHeight, true);
+    }
+
+    private void postSuccess(GeminiCallback callback, Bitmap bitmap, String rawGrid) {
+        mainHandler.post(() -> callback.onSuccess(bitmap, rawGrid));
+    }
+
+    private void postError(GeminiCallback callback, String error) {
+        mainHandler.post(() -> callback.onError(error));
+    }
+
+    private Bitmap convertGridToBitmap(String paddedGrid) {
+        Bitmap smallBitmap = Bitmap.createBitmap(GRID_SIZE, GRID_SIZE, Bitmap.Config.ARGB_8888);
         int index = 0;
-        for (int y = 0; y < 100; y++) {
-            for (int x = 0; x < 100; x++) {
-                char c = gridString.charAt(index++);
-                bitmap.setPixel(x, y, c == '0' ? Color.BLACK : Color.GRAY);
+
+        for (int y = 0; y < GRID_SIZE; y++) {
+            for (int x = 0; x < GRID_SIZE; x++) {
+                char c = paddedGrid.charAt(index++);
+                smallBitmap.setPixel(x, y, c == '0' ? Color.BLACK : Color.GRAY);
             }
         }
-        return bitmap;
+
+        // Scale it up. The 'false' stops Android from blurring it.
+        return Bitmap.createScaledBitmap(smallBitmap, 800, 800, false);
     }
 }

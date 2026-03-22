@@ -5,65 +5,105 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.View;
+import android.widget.ProgressBar;
+import android.widget.TextView;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 public class ProcessingActivity extends AppCompatActivity {
+
+    private TextView tvStatus;
+    private ProgressBar progressBar;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_processing);
 
-        String uriString = getIntent().getStringExtra("imageUri");
-        if (uriString == null) {
+        tvStatus = findViewById(R.id.tvStatus);
+        progressBar = findViewById(R.id.progressBar);
+
+        ArrayList<String> uriStrings = getIntent().getStringArrayListExtra("imageUris");
+        if (uriStrings == null || uriStrings.isEmpty()) {
             finish();
             return;
         }
 
-        Uri imageUri = Uri.parse(uriString);
-        processImage(imageUri);
+        processImages(uriStrings);
     }
 
-    private void processImage(Uri imageUri) {
-        try {
-            BitmapFactory.Options options = new BitmapFactory.Options();
-            options.inJustDecodeBounds = true;
-            InputStream inputStream = getContentResolver().openInputStream(imageUri);
-            BitmapFactory.decodeStream(inputStream, null, options);
-            if (inputStream != null) inputStream.close();
+    private void processImages(ArrayList<String> uriStrings) {
+        // Move decoding to a background thread so we don't freeze the UI processing 5 huge images
+        new Thread(() -> {
+            List<Bitmap> bitmaps = new ArrayList<>();
+            try {
+                for (String uriString : uriStrings) {
+                    Uri imageUri = Uri.parse(uriString);
 
-            options.inSampleSize = calculateInSampleSize(options, 1024, 1024);
-            options.inJustDecodeBounds = false;
+                    BitmapFactory.Options options = new BitmapFactory.Options();
+                    options.inJustDecodeBounds = true;
+                    InputStream inputStream = getContentResolver().openInputStream(imageUri);
+                    BitmapFactory.decodeStream(inputStream, null, options);
+                    if (inputStream != null) inputStream.close();
 
-            inputStream = getContentResolver().openInputStream(imageUri);
-            Bitmap selectedImage = BitmapFactory.decodeStream(inputStream, null, options);
-            if (inputStream != null) inputStream.close();
+                    options.inSampleSize = calculateInSampleSize(options, 1024, 1024);
+                    options.inJustDecodeBounds = false;
 
-            if (selectedImage == null) throw new Exception("Failed to decode image.");
+                    inputStream = getContentResolver().openInputStream(imageUri);
+                    Bitmap selectedImage = BitmapFactory.decodeStream(inputStream, null, options);
+                    if (inputStream != null) inputStream.close();
 
-            GeminiClient client = new GeminiClient();
-            client.generateFloorPlan(selectedImage, new GeminiClient.GeminiCallback() {
-                @Override
-                public void onSuccess(Bitmap floorPlan) {
-                    saveTempPlanAndReview(floorPlan);
+                    if (selectedImage != null) {
+                        bitmaps.add(selectedImage);
+                    }
                 }
 
-                @Override
-                public void onError(String errorMessage) {
-                    runOnUiThread(() -> {
-                        Toast.makeText(ProcessingActivity.this, "Error: " + errorMessage, Toast.LENGTH_LONG).show();
-                        finish();
-                    });
-                }
-            });
-        } catch (Exception e) {
-            Toast.makeText(this, "Failed to load image", Toast.LENGTH_SHORT).show();
-            finish();
-        }
+                if (bitmaps.isEmpty()) throw new Exception("Failed to decode any images.");
+
+                GeminiClient client = new GeminiClient();
+                client.generateFloorPlan(bitmaps, new GeminiClient.GeminiCallback() {
+                    @Override
+                    public void onSuccess(Bitmap floorPlan, String rawGrid) {
+                        runOnUiThread(() -> {
+                            progressBar.setVisibility(View.GONE);
+
+                            StringBuilder formattedGrid = new StringBuilder();
+                            for (int i = 0; i < rawGrid.length(); i += GeminiClient.GRID_SIZE) {
+                                int end = Math.min(i + GeminiClient.GRID_SIZE, rawGrid.length());
+                                formattedGrid.append(rawGrid.substring(i, end)).append("\n");
+                            }
+
+                            tvStatus.setText(formattedGrid.toString());
+
+                            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                                saveTempPlanAndReview(floorPlan);
+                            }, 5000);
+                        });
+                    }
+
+                    @Override
+                    public void onError(String errorMessage) {
+                        runOnUiThread(() -> {
+                            Toast.makeText(ProcessingActivity.this, "Error: " + errorMessage, Toast.LENGTH_LONG).show();
+                            finish();
+                        });
+                    }
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    Toast.makeText(this, "Failed to load images: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                    finish();
+                });
+            }
+        }).start();
     }
 
     private int calculateInSampleSize(BitmapFactory.Options options, int reqWidth, int reqHeight) {
